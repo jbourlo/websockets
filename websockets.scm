@@ -9,6 +9,7 @@
    ; high level API
    with-websocket with-concurrent-websocket
    send-message receive-message current-websocket
+   websocket-connect websocket? websocket-concurrent?
 
    ; low level API
    ;; send-frame read-frame read-frame-payload
@@ -26,7 +27,7 @@
 (import chicken scheme data-structures extras ports posix foreign
         srfi-13 srfi-14 srfi-18)
 (use srfi-1 srfi-4 spiffy intarweb uri-common base64 simple-sha1
-     mailbox comparse)
+     mailbox comparse http-client)
 
 (define-inline (neq? obj1 obj2) (not (eq? obj1 obj2)))
 
@@ -510,16 +511,7 @@
               'open               ; websocket state
               (make-mailbox "send")
               (make-mailbox "read")
-              concurrent))
-         (ping-thread
-          (make-thread
-           (lambda ()
-             (let loop ()
-               (thread-sleep! (ping-interval))
-               (when (eq? (websocket-state ws) 'open)
-                     (send-message "" 'ping ws)
-                     (loop))))
-           "ping thread")))
+              concurrent)))
 
     ; make sure the request meets the spec for websockets
     (cond ((not (and (member 'upgrade (header-values 'connection headers))
@@ -542,31 +534,42 @@
     (flush-output (response-port (current-response)))
 
     ; connection timeout thread
-    (when (> (connection-timeout) 0)
-          (thread-start!
-           (lambda ()
-             (let loop ()
-               (let ((t (websocket-last-message-timestamp ws)))
-                  ; Add one to attempt to alleviate checking the timestamp
-                  ; right before when the timeout should happen.
-                 (thread-sleep! (+ 1 (connection-timeout)))
-                 (when (eq? (websocket-state ws) 'open)
-                       (if (< (- (time->seconds (current-time))
-                                 (time->seconds (websocket-last-message-timestamp ws)))
-                              (connection-timeout))
-                           (loop)
-                           (begin (thread-signal!
-                                   (websocket-user-thread ws)
-                                   (make-websocket-exception
-                                    (make-property-condition 'connection-timeout)))
-                                  (close-websocket ws close-reason: 'going-away)))))))))
-
-    (when (> (ping-interval) 0)
-          (thread-start! ping-thread))
-
+    (validate-connection ws)
     ws))
+(define (validate-connection ws)
+ (define ping-thread
+  (make-thread
+   (lambda ()
+     (let loop ()
+       (thread-sleep! (ping-interval))
+       (when (eq? (websocket-state ws) 'open)
+             (send-message "" 'ping ws)
+             (loop))))
+   "ping thread"))
+ 
+  (when (> (connection-timeout) 0)
+        (thread-start!
+         (lambda ()
+           (let loop ()
+             (let ((t (websocket-last-message-timestamp ws)))
+                ; Add one to attempt to alleviate checking the timestamp
+                ; right before when the timeout should happen.
+               (thread-sleep! (+ 1 (connection-timeout)))
+               (when (eq? (websocket-state ws) 'open)
+                     (if (< (- (time->seconds (current-time))
+                               (time->seconds (websocket-last-message-timestamp ws)))
+                            (connection-timeout))
+                         (loop)
+                         (begin (thread-signal!
+                                 (websocket-user-thread ws)
+                                 (make-websocket-exception
+                                  (make-property-condition 'connection-timeout)))
+                                (close-websocket ws close-reason: 'going-away)))))))))
 
-(define (with-websocket proc #!optional (concurrent #f))
+  (when (> (ping-interval) 0)
+        (thread-start! ping-thread)))
+
+(define (with-websocket proc #!optional (concurrent #f) (client #f))
   (define (handle-error close-reason exn)
     (set-websocket-state! (current-websocket) 'closing)
     (close-websocket (current-websocket) close-reason: close-reason)
@@ -577,7 +580,10 @@
     (when (propagate-common-errors)
           (signal exn)))
   (parameterize
-   ((current-websocket (websocket-accept concurrent)))
+   ((current-websocket 
+                       (if (string? client) 
+                           (websocket-connect client) 
+                           (websocket-accept concurrent))))
    (condition-case
     (begin (proc)
            (close-websocket)
@@ -618,4 +624,40 @@
 (define (upgrade-to-websocket #!optional (concurrent #f))
   (websocket-accept concurrent))
 
+;; Websocket connect start -- jbourlo
+(define key
+  (base64-encode "magickey"))
+(define (ws-upgrade uri) 
+  (let ((upgrade-req (make-request method: 'GET
+                uri: (uri-reference uri)
+                headers: (headers '( 
+                                    (Connection Upgrade) 
+                                    (Upgrade websocket)
+                                    (Sec-Websocket-Key key)
+                                    (Sec-Websocket-Version 13))))))
+        (lambda ()
+          (call-with-response 
+            upgrade-req
+            (lambda (req) req)
+            (lambda (res) res))))) 
+        
+(define (websocket-connect uri #!optional (concurrent #f))
+  (call-with-values 
+    (ws-upgrade uri)
+    (lambda (data req res)
+      (let* ((user-thread (current-thread))
+             (headers (response-headers res))
+             (ws (make-websocket
+                  (response-port res)
+                  (request-port req)
+                  user-thread
+                  (make-mutex "send")
+                  (make-mutex "read")
+                  (current-time)
+                  'open               ; websocket state
+                  (make-mailbox "send")
+                  (make-mailbox "read")
+                  concurrent)))
+              (validate-connection ws)
+              ws))))
 )
