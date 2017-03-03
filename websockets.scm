@@ -569,7 +569,7 @@
   (when (> (ping-interval) 0)
         (thread-start! ping-thread)))
 
-(define (with-websocket proc #!optional (concurrent #f) (client #f))
+(define (with-websocket proc client #!optional (concurrent #f))
   (define (handle-error close-reason exn)
     (set-websocket-state! (current-websocket) 'closing)
     (close-websocket (current-websocket) close-reason: close-reason)
@@ -582,7 +582,7 @@
   (parameterize
    ((current-websocket 
                        (if (string? client) 
-                           (websocket-connect client) 
+                           (websocket-connect client concurrent) 
                            (websocket-accept concurrent))))
    (condition-case
     (begin (proc)
